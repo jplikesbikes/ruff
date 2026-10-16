@@ -652,6 +652,84 @@ impl<'db> GenericContext<'db> {
         Some(Self::from_typevar_instances(db, &env, variables))
     }
 
+    /// Returns the `Callable`s in a return type that should become generic, each with the
+    /// typevars it owns, outermost first. `outermost` is the outermost `Callable` containing
+    /// every use of `typevars`, which is not always the one that should own them.
+    ///
+    /// A typevar can only be solved by a call that supplies an argument constraining it, so a
+    /// callable that never mentions the typevar in its _parameters_ is a factory: the callable
+    /// that really uses it is nested further inside the return type. Giving the factory the
+    /// generic context leaves the typevar unsolvable, and every call of the factory then
+    /// materializes it to `Unknown`/`...`, erasing the inner signature, or leaves it dangling as
+    /// a free typevar that no later call can bind.
+    ///
+    /// We therefore walk inwards, assigning each typevar to the first callable that can solve
+    /// it. Different typevars can stop at different depths: in
+    /// `Callable[[U], Callable[[Callable[P, T]], Callable[P, T]]]`, `U` is solved by the outer
+    /// call and `P`/`T` by the decorator it returns. A single-level decorator factory stops
+    /// immediately, at `outermost`.
+    fn assign_typevar_owners(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        outermost: CallableType<'db>,
+        typevars: &FxOrderSet<BoundTypeVarInstance<'db>>,
+    ) -> Vec<(CallableType<'db>, FxOrderSet<BoundTypeVarInstance<'db>>)> {
+        let mut owners = Vec::new();
+        let mut remaining = typevars.clone();
+        let mut callable = outermost;
+        // Recursive types could otherwise cycle forever.
+        let mut seen = FxHashSet::default();
+
+        while !remaining.is_empty() && seen.insert(callable) {
+            let signatures = callable.signatures(db);
+            let mut iter = signatures.iter();
+            // Only descend through a non-overloaded callable: with several overloads there is no
+            // single return type to follow.
+            let (Some(signature), None) = (iter.next(), iter.next()) else {
+                break;
+            };
+
+            // Typevars this callable mentions in its parameters are ones a call of it can solve.
+            let solved_here: FxOrderSet<_> = remaining
+                .iter()
+                .copied()
+                .filter(|bound_typevar| {
+                    let identity = bound_typevar.typevar(db).identity(db);
+                    signature.parameters().iter().any(|parameter| {
+                        parameter
+                            .annotated_type()
+                            .references_typevar(db, env, identity)
+                            || parameter.eager_default_type().is_some_and(|default| {
+                                default.references_typevar(db, env, identity)
+                            })
+                    })
+                })
+                .collect();
+            if !solved_here.is_empty() {
+                remaining.retain(|bound_typevar| !solved_here.contains(bound_typevar));
+                owners.push((callable, solved_here));
+            }
+            if remaining.is_empty() {
+                break;
+            }
+
+            // The rest are in the return type, since the caller guarantees they all occur
+            // somewhere in `callable`. Descend only if that return type is exactly a callable; if
+            // they sit inside a union or a generic class instead, no nested callable owns them on
+            // its own and this one stays the best answer.
+            let Type::Callable(inner) = signature.return_ty else {
+                break;
+            };
+            callable = inner;
+        }
+
+        // Whatever no callable could solve stays with the innermost one we reached.
+        if !remaining.is_empty() {
+            owners.push((callable, remaining));
+        }
+        owners
+    }
+
     pub(crate) fn remove_callable_only_typevars(
         db: &'db dyn Db,
         generic_context: Option<Self>,
@@ -667,8 +745,11 @@ impl<'db> GenericContext<'db> {
             /// A map containing all of the `Callable`s in the return type, along with the typevars
             /// that appear in each. (Note that at this point, we have not yet determined if those
             /// typevars _only_ appear there.)
+            ///
+            /// Insertion-ordered: we iterate this to build the rescoped callables, and the
+            /// order typevars are added to a generic context is observable in the result.
             found_inside_callable_return:
-                FxHashMap<CallableType<'db>, FxOrderSet<BoundTypeVarInstance<'db>>>,
+                FxIndexMap<CallableType<'db>, FxOrderSet<BoundTypeVarInstance<'db>>>,
         }
 
         impl<'db> TypeVarLocations<'db> {
@@ -687,39 +768,69 @@ impl<'db> GenericContext<'db> {
             ) {
                 let env = ProgramEnvironment::from_definition(function_definition);
                 let mut found_only_inside_callable_return = FxHashSet::default();
-                let replacements = self
-                    .found_inside_callable_return
-                    .into_iter()
-                    .filter_map(|(callable, mut bound_typevars)| {
-                        // Only keep typevars that appear _only_ in this callable and are
-                        // actually bound by this function. If we renamed typevars bound by an
-                        // enclosing generic context (e.g., class typevars in a method), we'd
-                        // disconnect them from class specialization.
-                        bound_typevars.retain(|bound_typevar| {
-                            !self.found_outside_callable_return.contains(bound_typevar)
-                                && bound_typevar.binding_context(db).definition()
-                                    == Some(function_definition)
-                        });
-                        if bound_typevars.is_empty() {
-                            return None;
-                        }
 
-                        // We're going to use this later to trim the function's generic context. So
-                        // it's important that we do this first, so that we're tracking the
-                        // original, not-yet-renamed typevars.
-                        found_only_inside_callable_return.extend(bound_typevars.iter().copied());
+                let mut replacements: FxHashMap<CallableType<'db>, CallableType<'db>> =
+                    FxHashMap::default();
+                for (callable, mut bound_typevars) in self.found_inside_callable_return {
+                    // Only keep typevars that appear _only_ in this callable and are
+                    // actually bound by this function. If we renamed typevars bound by an
+                    // enclosing generic context (e.g., class typevars in a method), we'd
+                    // disconnect them from class specialization.
+                    bound_typevars.retain(|bound_typevar| {
+                        !self.found_outside_callable_return.contains(bound_typevar)
+                            && bound_typevar.binding_context(db).definition()
+                                == Some(function_definition)
+                    });
+                    if bound_typevars.is_empty() {
+                        continue;
+                    }
+
+                    // We're going to use this later to trim the function's generic context. So
+                    // it's important that we do this first, so that we're tracking the
+                    // original, not-yet-renamed typevars.
+                    found_only_inside_callable_return.extend(bound_typevars.iter().copied());
+
+                    // Typevars found in the same outermost callable do not necessarily belong to
+                    // the same one: in `Callable[[U], Callable[[Callable[P, T]], Callable[P, T]]]`
+                    // `U` is solved by the outer call and `P`/`T` by the decorator it returns.
+                    //
+                    // `assign_typevar_owners` returns owners outermost first, so rewrite them in
+                    // reverse: an outer owner's signature contains the inner ones, and has to be
+                    // built from their already-rescoped replacements.
+                    let owners =
+                        GenericContext::assign_typevar_owners(db, &env, callable, &bound_typevars);
+                    // Kept separate from `replacements` so that only owners nested in *this*
+                    // return type can rewrite each other. Owners under different outermost
+                    // callables are in disjoint subtrees and never occur inside one another.
+                    let mut nested_replacements: FxHashMap<CallableType<'db>, CallableType<'db>> =
+                        FxHashMap::default();
+                    for (owner, owned) in owners.into_iter().rev() {
+                        // Pull in any deeper callables we have already rescoped. Skipped when
+                        // there are none, which is the common single-owner case, because
+                        // rebuilding a signature needlessly perturbs recursive types.
+                        let signatures = if nested_replacements.is_empty() {
+                            owner.signatures(db).clone()
+                        } else {
+                            let nested = TypeMapping::RescopeReturnCallables(&nested_replacements);
+                            owner.signatures(db).apply_type_mapping_impl(
+                                db,
+                                &nested,
+                                TypeContext::default(),
+                                &ApplyTypeMappingVisitor::new(&env),
+                            )
+                        };
 
                         // Then create a new typevar, with a 'return suffix, for each of the
-                        // typevars that only appear in this callable, and update the callable's
-                        // signature (and generic context) to use those new typevars.
-                        let typevar_replacements: FxIndexMap<_, _> = bound_typevars
+                        // typevars that this callable owns, and update the callable's signature
+                        // (and generic context) to use those new typevars.
+                        let typevar_replacements: FxIndexMap<_, _> = owned
                             .iter()
                             .map(|bound_typevar| {
                                 (*bound_typevar, bound_typevar.with_name_suffix(db, "return"))
                             })
                             .collect();
                         let apply = ApplySpecialization::ReturnCallables(&typevar_replacements);
-                        let signatures = callable.signatures(db).apply_type_mapping_impl(
+                        let signatures = signatures.apply_type_mapping_impl(
                             db,
                             &TypeMapping::ApplySpecialization(apply),
                             TypeContext::default(),
@@ -732,11 +843,10 @@ impl<'db> GenericContext<'db> {
                         );
                         let signatures =
                             signatures.with_inherited_generic_context(db, generic_context);
-                        let replacement = callable.with_signatures(db, signatures);
-
-                        Some((callable, replacement))
-                    })
-                    .collect();
+                        nested_replacements.insert(owner, owner.with_signatures(db, signatures));
+                    }
+                    replacements.extend(nested_replacements);
+                }
 
                 (found_only_inside_callable_return, replacements)
             }

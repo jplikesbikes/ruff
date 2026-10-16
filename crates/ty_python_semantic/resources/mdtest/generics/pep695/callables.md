@@ -388,11 +388,9 @@ from ty_extensions._internal import generic_context
 def nested_factory[T]() -> Callable[[], Callable[[T], T]]:
     raise NotImplementedError
 
-# TODO: should be `() -> ([T'return](T'return, /) -> T'return)`
-# revealed: [T'return]() -> ((T'return, /) -> T'return)
+# revealed: () -> ([T'return](T'return, /) -> T'return)
 reveal_type(nested_factory())
-# TODO: should be `Literal[1]`
-# revealed: Unknown
+# revealed: Literal[1]
 reveal_type(nested_factory()()(1))
 ```
 
@@ -410,21 +408,17 @@ def configurable[**P, T]() -> Callable[[str], Callable[[Callable[P, T]], Callabl
 # Note that neither `configurable` nor the callable it returns directly is generic!
 # revealed: None
 reveal_type(generic_context(configurable))
-# TODO: should be `(str, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))`
-# revealed: [**P'return, T'return](str, /) -> (((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
+# revealed: (str, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
 reveal_type(configurable())
 
 # The decorator one level further in is the generic one.
-# TODO: should be `ty_extensions._internal.GenericContext[P'return@configurable, T'return@configurable]`
-# revealed: None
+# revealed: ty_extensions._internal.GenericContext[P'return@configurable, T'return@configurable]
 reveal_type(generic_context(configurable()("config")))
 
 # And so the decorated function keeps its signature.
-# TODO: should be `[T](t: T) -> T`
-# revealed: (...) -> Unknown
+# revealed: [T](t: T) -> T
 reveal_type(configurable()("config")(identity))
-# TODO: should be `Literal[1]`
-# revealed: Unknown
+# revealed: Literal[1]
 reveal_type(configurable()("config")(identity)(1))
 ```
 
@@ -436,14 +430,11 @@ def split_depths[U, **P, T]() -> Callable[[U], Callable[[Callable[P, T]], Callab
     raise NotImplementedError
 
 # `U` is solved by the outer call, `P` and `T` by the decorator it returns.
-# TODO: should be `[U'return](U'return, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))`
-# revealed: [U'return, **P'return, T'return](U'return, /) -> (((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
+# revealed: [U'return](U'return, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
 reveal_type(split_depths())
-# TODO: should be `[**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return)`
-# revealed: ((...) -> Unknown, /) -> ((...) -> Unknown)
+# revealed: [**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return)
 reveal_type(split_depths()("config"))
-# TODO: should be `[T](t: T) -> T`
-# revealed: (...) -> Unknown
+# revealed: [T](t: T) -> T
 reveal_type(split_depths()("config")(identity))
 ```
 
