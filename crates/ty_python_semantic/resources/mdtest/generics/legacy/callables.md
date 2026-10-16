@@ -298,6 +298,114 @@ reveal_type(generic_context(outside_callable(int_identity)))
 outside_callable(int_identity)("string")
 ```
 
+## Naming a generic `Callable`: nested return values
+
+The callable that becomes generic is the one that can solve the typevars, by taking them as
+parameters. That is not always the outermost `Callable` in the return type.
+
+Here the outermost callable takes no parameters, so calling it cannot solve `T`. The callable it
+returns is the generic one:
+
+```py
+from typing import Callable, ParamSpec, TypeVar
+from ty_extensions._internal import generic_context
+
+P = ParamSpec("P")
+T = TypeVar("T")
+U = TypeVar("U")
+
+def nested_factory() -> Callable[[], Callable[[T], T]]:
+    raise NotImplementedError
+
+# TODO: should be `() -> ([T'return](T'return, /) -> T'return)`
+# revealed: [T'return]() -> ((T'return, /) -> T'return)
+reveal_type(nested_factory())
+# TODO: should be `Literal[1]`
+# revealed: Unknown
+reveal_type(nested_factory()()(1))
+```
+
+A decorator factory that takes configuration first puts the decorator one level further in. The
+outer callable does not mention `P` or `T` in its parameters, so calling it cannot solve them. The
+decorator it returns is the generic one:
+
+```py
+def identity(t: T) -> T:
+    return t
+
+def configurable() -> Callable[[str], Callable[[Callable[P, T]], Callable[P, T]]]:
+    raise NotImplementedError
+
+# Note that neither `configurable` nor the callable it returns directly is generic!
+# revealed: None
+reveal_type(generic_context(configurable))
+# TODO: should be `(str, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))`
+# revealed: [**P'return, T'return](str, /) -> (((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
+reveal_type(configurable())
+
+# The decorator one level further in is the generic one.
+# TODO: should be `ty_extensions._internal.GenericContext[P'return@configurable, T'return@configurable]`
+# revealed: None
+reveal_type(generic_context(configurable()("config")))
+
+# And so the decorated function keeps its signature.
+# TODO: should be `[T](t: T) -> T`
+# revealed: (...) -> Unknown
+reveal_type(configurable()("config")(identity))
+# TODO: should be `Literal[1]`
+# revealed: Unknown
+reveal_type(configurable()("config")(identity)(1))
+```
+
+Each typevar is considered separately, so typevars introduced at different depths end up on the
+callable that can solve each one:
+
+```py
+def split_depths() -> Callable[[U], Callable[[Callable[P, T]], Callable[P, T]]]:
+    raise NotImplementedError
+
+# `U` is solved by the outer call, `P` and `T` by the decorator it returns.
+# TODO: should be `[U'return](U'return, /) -> ([**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return))`
+# revealed: [U'return, **P'return, T'return](U'return, /) -> (((**P'return) -> T'return, /) -> ((**P'return) -> T'return))
+reveal_type(split_depths())
+# TODO: should be `[**P'return, T'return]((**P'return) -> T'return, /) -> ((**P'return) -> T'return)`
+# revealed: ((...) -> Unknown, /) -> ((...) -> Unknown)
+reveal_type(split_depths()("config"))
+# TODO: should be `[T](t: T) -> T`
+# revealed: (...) -> Unknown
+reveal_type(split_depths()("config")(identity))
+```
+
+We stop at the first callable that can solve a typevar, so a typevar used by an intermediate
+callable keeps that callable generic:
+
+```py
+def solved_early() -> Callable[[Callable[P, T]], Callable[[int], Callable[P, T]]]:
+    raise NotImplementedError
+
+def int_identity(x: int) -> int:
+    return x
+
+# revealed: ty_extensions._internal.GenericContext[P'return@solved_early, T'return@solved_early]
+reveal_type(generic_context(solved_early()))
+# revealed: (int, /) -> ((x: int) -> int)
+reveal_type(solved_early()(int_identity))
+```
+
+We only look inside a return type that is exactly a callable. When the nested callable is part of a
+union, the typevar stays on the outer callable, which cannot solve it:
+
+```py
+def maybe_nested() -> Callable[[], Callable[[T], T] | None]:
+    raise NotImplementedError
+
+# revealed: ty_extensions._internal.GenericContext[T'return@maybe_nested]
+reveal_type(generic_context(maybe_nested()))
+# TODO: should be `([T'return](T'return, /) -> T'return) | None`
+# revealed: ((Unknown, /) -> Unknown) | None
+reveal_type(maybe_nested()())
+```
+
 ## Union without intersection does not consider budget
 
 A single union upper bound remains precise even when it has more alternatives than the solution
