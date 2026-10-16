@@ -979,7 +979,13 @@ impl<'db> CallableType<'db> {
         visitor: &ApplyTypeMappingVisitor<'_, 'db>,
     ) -> Self {
         if let TypeMapping::RescopeReturnCallables(replacements) = type_mapping {
-            return replacements.get(&self).copied().unwrap_or(self);
+            // A replacement has already had its typevars rescoped, so return it as-is. When this
+            // callable is not itself being replaced we must still recurse: the callable being
+            // rescoped can be nested inside this one's signature (a decorator returned by a
+            // factory), and returning `self` here would leave it unrewritten.
+            if let Some(replacement) = replacements.get(&self) {
+                return *replacement;
+            }
         }
 
         self.with_signatures(
